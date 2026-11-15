@@ -1,0 +1,69 @@
+import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
+import { OccOverview } from './OccOverview'
+import { OccUsers } from './OccUsers'
+import { OccStatusMap } from './OccStatusMap'
+import { OccSynonyms } from './OccSynonyms'
+import { OccScoringTemplate } from './OccScoringTemplate'
+import { OccResourceTeam } from './OccResourceTeam'
+import { OccEmailTemplates } from './OccEmailTemplates'
+import { OccInternalDomains } from './OccInternalDomains'
+import { OccSettingsPackage } from './OccSettingsPackage'
+import { OccApprovals } from './OccApprovals'
+import { OccGrades } from './OccGrades'
+import { OccModels } from './OccModels'
+import { OccAuditLog } from './OccAuditLog'
+import { OccAdminSettings } from './OccAdminSettings'
+import { OccCvExtractions } from './OccCvExtractions'
+
+const GROUPS: [string, [string, string][]][] = [
+  ['People', [['users', 'Users & passwords'], ['resource-team', 'Resource-team list'], ['email-templates', 'Email templates']]],
+  ['Data', [['approvals', 'DL / CT approvals'], ['grades', 'Grade list'], ['status-map', 'Status list & mapping'], ['synonyms', 'Skill synonyms'], ['internal-domains', 'Internal domains']]],
+  ['Matching', [['scoring-template', 'Scoring template'], ['models', 'Approved models']]],
+  ['Operations', [['cv-extractions', 'Cached CV text'], ['audit-log', 'Audit log'], ['admin-settings', 'Admin settings'], ['settings-package', 'Settings packages']]],
+]
+
+/** OCC — Object Control Center, Admin only (REQ-ROLE-03, GUI_OCC_DESIGN.md §16). */
+export function OccPage() {
+  return (
+    <div className="page">
+      <div className="page-header">
+        <h1>OCC — Object Control Center</h1>
+        <span className="meta">Admin only · every change is audit-logged</span>
+      </div>
+      <div className="subnav-layout">
+        <nav className="subnav" aria-label="OCC sections">
+          <NavLink to="/occ/overview">Overview</NavLink>
+          {GROUPS.map(([g, items]) => (
+            <div key={g} className="stack" style={{ gap: 2 }}>
+              <div className="group">{g}</div>
+              {items.map(([id, label]) => (
+                <NavLink key={id} to={`/occ/${id}`}>
+                  {label}
+                </NavLink>
+              ))}
+            </div>
+          ))}
+        </nav>
+        <Routes>
+          <Route index element={<Navigate to="overview" replace />} />
+          <Route path="overview" element={<OccOverview />} />
+          <Route path="cv-extractions" element={<OccCvExtractions />} />
+          <Route path="users" element={<OccUsers />} />
+          <Route path="resource-team" element={<OccResourceTeam />} />
+          <Route path="email-templates" element={<OccEmailTemplates />} />
+          <Route path="status-map" element={<OccStatusMap />} />
+          <Route path="synonyms" element={<OccSynonyms />} />
+          <Route path="internal-domains" element={<OccInternalDomains />} />
+          <Route path="scoring-template" element={<OccScoringTemplate />} />
+          <Route path="approvals" element={<OccApprovals />} />
+          <Route path="grades" element={<OccGrades />} />
+          <Route path="models" element={<OccModels />} />
+          <Route path="audit-log" element={<OccAuditLog />} />
+          <Route path="admin-settings" element={<OccAdminSettings />} />
+          <Route path="settings-package" element={<OccSettingsPackage />} />
+          <Route path="*" element={<Navigate to="overview" replace />} />
+        </Routes>
+      </div>
+    </div>
+  )
+}

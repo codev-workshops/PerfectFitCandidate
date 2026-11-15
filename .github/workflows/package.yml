@@ -1,0 +1,113 @@
+name: Package Windows portable ZIP
+
+on:
+  pull_request:
+    paths:
+      - "PFC/packaging/**"
+      - ".github/workflows/package.yml"
+      - "PFC/app/pyproject.toml"
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install packaging test tools
+        run: python -m pip install pytest ruff
+
+      - name: Test packaging helpers
+        run: python -m pytest PFC/packaging/tests
+
+      - name: Lint packaging tools
+        run: ruff check --config PFC/app/pyproject.toml PFC/packaging
+
+      - name: Check packaging formatting
+        run: ruff format --check --config PFC/app/pyproject.toml PFC/packaging
+
+      - name: Build portable ZIP
+        run: python PFC/packaging/build_zip.py --out PFC/packaging/dist
+
+      - name: Extract package for smoke test
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem "PFC/packaging/dist/PFC-*-win-x64.zip" | Select-Object -First 1
+          if (-not $archive) { throw "Package ZIP was not created." }
+          $packageDir = Join-Path $env:RUNNER_TEMP "PFC-package"
+          Expand-Archive -Path $archive.FullName -DestinationPath $packageDir -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "PFC_PACKAGE_DIR=$packageDir"
+
+      - name: Smoke-test bundled Python and native dependencies
+        shell: pwsh
+        run: |
+          & "$env:PFC_PACKAGE_DIR\python\python.exe" -c "import pfc, fastapi, numpy, onnxruntime, sqlite_vec, win32com.client"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:PFC_PACKAGE_DIR\llama\llama-server.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pfc-windows-x64-portable
+          path: PFC/packaging/dist/PFC-*-win-x64.zip
+          if-no-files-found: error
+
+  model-complete:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/pfc-model-cache
+          key: pfc-models-${{ hashFiles('PFC/packaging/MODELS.lock') }}
+      - name: Build model-complete offline ZIP (verify all lock hashes)
+        run: python PFC/packaging/build_zip.py --with-models --models-cache "${{ runner.temp }}/pfc-model-cache" --out PFC/packaging/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pfc-windows-x64-with-models
+          path: PFC/packaging/dist/PFC-*-win-x64.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  offline-first-run:
+    needs: model-complete
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: pfc-windows-x64-with-models
+          path: model-artifact
+      - name: Offline first run as a standard user
+        shell: pwsh
+        run: ./PFC/packaging/offline_smoke.ps1 -Archive (Get-ChildItem model-artifact/*.zip | Select-Object -First 1).FullName
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: offline-smoke-evidence
+          path: ${{ runner.temp }}/pfc-offline-evidence
+          if-no-files-found: warn

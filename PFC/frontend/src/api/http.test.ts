@@ -1,0 +1,822 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { resolveApiMode } from '../config'
+import { ApiError } from './client'
+import { HttpApiClient, setUnauthorizedHandler } from './http'
+import { fromGrades, toCurrentUser, toDashboardQuery, toEmailDraft, toExportQuery, toGrade, toResource, type ResourceItem } from './mappers'
+
+const AUTH = {
+  user: { user_id: 1, email: 'admin@example.com', display_name: 'OCC Admin', role: 'Admin', must_change_password: false },
+  role_at_login: 'Admin',
+  must_change_password: false,
+  csrf_token: 'tok-1',
+}
+
+const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json', ...headers } })
+const problem = (status: number, code: string, detail: string, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify({ type: 'about:blank', title: detail, status, detail, code, request_id: 'r1' }), {
+    status,
+    headers: { 'Content-Type': 'application/problem+json', ...headers },
+  })
+
+let fetchMock: ReturnType<typeof vi.fn>
+const headersOf = (call: number) => (fetchMock.mock.calls[call][1] as RequestInit).headers as Record<string, string>
+
+beforeEach(() => {
+  fetchMock = vi.fn()
+  vi.stubGlobal('fetch', fetchMock)
+})
+afterEach(() => {
+  vi.unstubAllGlobals()
+  setUnauthorizedHandler(null)
+})
+
+it('maps email transport and handoff timestamps from the backend', async () => {
+  const api = new HttpApiClient('/api/v1')
+  const draft = {
+    message_id: 7,
+    demand_id: 3,
+    resource_id: 4,
+    result_id: 5,
+    rank: 1,
+    selected: true,
+    to_address: 'candidate@example.com',
+    cc: [],
+    subject: 'Subject',
+    body_html: '<p>Body</p>',
+    status: 'Sending',
+    created_at: '2026-01-01T00:00:00Z',
+    sent_at: null,
+    handoff_at: '2026-01-02T03:04:05Z',
+    last_error: null,
+  }
+  fetchMock
+    .mockResolvedValueOnce(json({ drafts: [draft], transport: 'eml_handoff' }))
+    .mockResolvedValueOnce(json({ drafts: [draft], transport: 'other' }))
+
+  const handoff = await api.listEmails()
+  expect(handoff.items[0]?.handoffAt).toBe(draft.handoff_at)
+  expect(handoff.items[0]?.status).toBe('Approved')
+  expect(handoff.transport).toEqual({ transport: 'Outlook draft file', outlookDetected: false })
+  expect((await api.listEmails()).transport).toEqual({
+    transport: 'Outlook COM',
+    outlookDetected: true,
+  })
+})
+
+it('sends uncertainty confirmation only when requested for an Outlook handoff', async () => {
+  const api = new HttpApiClient('/api/v1')
+  const draft = {
+    message_id: 7,
+    demand_id: 3,
+    resource_id: 4,
+    result_id: 5,
+    rank: 1,
+    selected: true,
+    to_address: 'candidate@example.com',
+    cc: [],
+    subject: 'Subject',
+    body_html: '<p>Body</p>',
+    status: 'Sending',
+    created_at: '2026-01-01T00:00:00Z',
+    sent_at: null,
+    handoff_at: '2026-01-02T03:04:05Z',
+    last_error: null,
+  }
+  fetchMock
+    .mockResolvedValueOnce(json({ draft, opened: false }))
+    .mockResolvedValueOnce(json({ draft, opened: false }))
+
+  await api.openEmailInOutlook(7)
+  await api.openEmailInOutlook(7, true)
+
+  expect((fetchMock.mock.calls[0]?.[1] as RequestInit).body).toBeUndefined()
+  expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+    confirm_uncertain: true,
+  })
+})
+
+it('confirms a previous Outlook send without a request body', async () => {
+  const api = new HttpApiClient('/api/v1')
+  const draft = {
+    message_id: 7,
+    demand_id: 3,
+    resource_id: 4,
+    result_id: 5,
+    rank: 1,
+    selected: true,
+    to_address: 'candidate@example.com',
+    cc: [],
+    subject: 'Subject',
+    body_html: '<p>Body</p>',
+    status: 'Sent',
+    created_at: '2026-01-01T00:00:00Z',
+    sent_at: '2026-01-02T03:04:05Z',
+    handoff_at: null,
+    last_error: null,
+  }
+  fetchMock.mockResolvedValueOnce(json(draft))
+
+  const confirmed = await api.confirmPreviousSend(7)
+
+  expect(confirmed.status).toBe('Sent')
+  expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/emails/7/previous-send/confirm')
+  expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method).toBe('POST')
+  expect((fetchMock.mock.calls[0]?.[1] as RequestInit).body).toBeUndefined()
+})
+
+it('maps suggestion and rejection routes and sends their request bodies', async () => {
+  const api = new HttpApiClient('/api/v1')
+  fetchMock
+    .mockResolvedValueOnce(json([{
+      term: 'Kubernetes',
+      term_norm: 'kubernetes',
+      ct_people: 2,
+      cv_people: 1,
+      jd_demands: 3,
+      closest: 'Kubernetes',
+    }]))
+    .mockResolvedValueOnce(json({}))
+    .mockResolvedValueOnce(json([]))
+    .mockResolvedValueOnce(json([{
+      term_norm: 'kubernetes',
+      term: 'Kubernetes',
+      rejected_by: 1,
+      rejected_at: '2026-01-01T00:00:00Z',
+    }]))
+    .mockResolvedValueOnce(json({ updated: 1 }))
+
+  expect(await api.listSkillSuggestions()).toEqual([{
+    term: 'Kubernetes',
+    termNorm: 'kubernetes',
+    ctPeople: 2,
+    cvPeople: 1,
+    jdDemands: 3,
+    closest: 'Kubernetes',
+  }])
+  await api.acceptSkillSuggestions([{ term: 'Kubernetes' }])
+  await api.rejectSkillSuggestions(['Kubernetes'])
+  expect((await api.listRejectedSkillTerms())[0]?.termNorm).toBe('kubernetes')
+  await api.restoreRejectedSkillTerms(['kubernetes'])
+
+  expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+    '/api/v1/occ/skill-suggestions',
+    '/api/v1/occ/skill-suggestions/accept',
+    '/api/v1/occ/skill-suggestions/reject',
+    '/api/v1/occ/skill-suggestions/rejected',
+    '/api/v1/occ/skill-suggestions/restore',
+  ])
+  expect(JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string)).toEqual({
+    items: [{ term: 'Kubernetes' }],
+  })
+  expect(JSON.parse((fetchMock.mock.calls[2]?.[1] as RequestInit).body as string)).toEqual({
+    terms: ['Kubernetes'],
+  })
+  expect(JSON.parse((fetchMock.mock.calls[4]?.[1] as RequestInit).body as string)).toEqual({
+    term_norms: ['kubernetes'],
+  })
+})
+
+describe('HttpApiClient — TDD §9.3 session + CSRF', () => {
+  it('uses the four summary routes and preserves their camelCase response', async () => {
+    const summary = { sentences: [{ text: 'SQL', evidence: 'SQL' }], model: 'local', createdAt: 'now', stale: true, droppedUngrounded: 1, sourceVersionId: 7 }
+    fetchMock.mockImplementation(() => Promise.resolve(json(summary)))
+    const client = new HttpApiClient('/api/v1')
+    expect(await client.getCandidateSummary(3)).toEqual(summary)
+    expect(await client.generateCandidateSummary(3)).toEqual(summary)
+    expect(await client.getDemandSummary(4)).toEqual(summary)
+    expect(await client.generateDemandSummary(4)).toEqual(summary)
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(['/api/v1/candidates/3/summary', '/api/v1/candidates/3/summary', '/api/v1/demands/4/summary', '/api/v1/demands/4/summary'])
+    expect(fetchMock.mock.calls.map(([, options]) => options.method)).toEqual(['GET', 'POST', 'GET', 'POST'])
+  })
+  it('maps the newest demand version text from demand detail', async () => {
+    fetchMock.mockResolvedValueOnce(json({
+      demand_id: 4,
+      code_requisition: 'T10004',
+      id_format_ok: true,
+      position_start_date: null,
+      account_name: null,
+      code_local_grade: null,
+      demand_request_name: null,
+      region: null,
+      bu: null,
+      owner: null,
+      jd_status: 'Not analysed',
+      current_version_id: 2,
+      versions: [
+        { version_no: 2, jd_sha256: 'new', created_at: 'now', jd_text_norm: 'Latest JD text' },
+        { version_no: 1, jd_sha256: 'old', created_at: 'before', jd_text_norm: 'Older JD text' },
+      ],
+    }))
+    const client = new HttpApiClient('/api/v1')
+
+    expect((await client.getDemand(4)).jdText).toBe('Latest JD text')
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/demands/4')
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit).method).toBe('GET')
+  })
+  it('preserves additive JD evidence flags through requirements review and save', async () => {
+    const api = new HttpApiClient('/api/v1')
+    const row = { demandId: 1, mandatorySkills: ['SQL'], items: [{ kind: 'mandatory_skill', text: 'SQL', jdReqId: 7, evidence: null, evidenceUnverified: true }] }
+    fetchMock.mockResolvedValueOnce(json(row)).mockResolvedValueOnce(json(row))
+    const draft = await api.getRequirements(1)
+    expect(draft.items?.[0].evidenceUnverified).toBe(true)
+    expect((await api.saveRequirements(draft)).items?.[0].evidence).toBeNull()
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string).items).toEqual(row.items)
+  })
+
+  it('uses camelCase classification and CV removal contracts with CSRF on writes', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json(AUTH))
+    await api.login({ role: 'Admin', email: 'admin@example.com', password: 'x' })
+    const classification = { candidateId: 7, effectiveClassification: 'Unknown', computedClassification: 'Internal', classificationOverride: 'Unknown', overrideReason: 'Reviewed', overrideBy: 1, overrideAt: '2026-11-01' }
+    fetchMock.mockResolvedValueOnce(json(classification))
+    expect(await api.setClassification(7, { classification: 'Unknown', reason: 'Reviewed' })).toEqual(classification)
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/candidates/7/classification')
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)).toEqual({ classification: 'Unknown', reason: 'Reviewed' })
+    expect(headersOf(1)['X-CSRF-Token']).toBe('tok-1')
+    const versions = [{ cvVersionId: 9, fileName: 'al**@example.com.docx', versionNo: 2, extractedAt: '2026-11-01', removed: false }]
+    fetchMock.mockResolvedValueOnce(json(versions))
+    expect(await api.listCvExtractions(7)).toEqual(versions)
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/v1/occ/candidates/7/cv-extractions')
+    expect(headersOf(2)['X-CSRF-Token']).toBeUndefined()
+    const counts = { versionsCleared: 1, chunksDeleted: 2, vectorsDeleted: 3, matchingVectorsDeleted: 4 }
+    fetchMock.mockResolvedValueOnce(json(counts)).mockResolvedValueOnce(json(counts))
+    expect(await api.clearCandidateExtractions(7)).toEqual(counts)
+    expect(await api.clearAllExtractions()).toEqual(counts)
+    expect(fetchMock.mock.calls[3][0]).toBe('/api/v1/occ/candidates/7/cv-extractions')
+    expect(fetchMock.mock.calls[4][0]).toBe('/api/v1/occ/cv-extractions')
+    for (const index of [3, 4]) {
+      expect((fetchMock.mock.calls[index][1] as RequestInit).method).toBe('DELETE')
+      expect(headersOf(index)['X-CSRF-Token']).toBe('tok-1')
+    }
+  })
+  it('sends cookies same-origin and X-CSRF-Token from the login response on writes only', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json(AUTH))
+    const user = await api.login({ role: 'Admin', email: 'admin@example.com', password: 'x' })
+    expect(user).toMatchObject({ userId: 1, fullName: 'OCC Admin', role: 'Admin', csrfToken: 'tok-1' })
+    expect(headersOf(0)['X-CSRF-Token']).toBeUndefined()
+
+    fetchMock.mockResolvedValueOnce(json([]))
+    await api.listGrades()
+    expect(headersOf(1)['X-CSRF-Token']).toBeUndefined()
+    expect((fetchMock.mock.calls[1][1] as RequestInit).credentials).toBe('same-origin')
+
+    fetchMock.mockResolvedValueOnce(json([{ code: 'A3', ordinal: 1, active: 1 }]))
+    await api.saveGrades([{ code: 'A3', order: 1, retired: false }])
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/v1/occ/grades')
+    expect(headersOf(2)['X-CSRF-Token']).toBe('tok-1')
+    expect(JSON.parse((fetchMock.mock.calls[2][1] as RequestInit).body as string)).toEqual([{ code: 'A3', active: true }])
+  })
+
+  it('refreshes the CSRF token after a password change', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json(AUTH)).mockResolvedValueOnce(json({ ...AUTH, csrf_token: 'tok-2' }))
+    await api.login({ role: 'Admin', email: 'admin@example.com', password: 'x' })
+    await api.changePassword({ currentPassword: 'old', newPassword: 'new' })
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)).toEqual({
+      current_password: 'old',
+      new_password: 'new',
+    })
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }))
+    await api.logout()
+    expect(headersOf(2)['X-CSRF-Token']).toBe('tok-2')
+  })
+})
+
+describe('HttpApiClient — RFC 9457 problem+json', () => {
+  it('parses code and shows a friendly message', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(problem(403, 'CSRF_INVALID', 'Invalid CSRF token'))
+    const err = await api.saveGrades([]).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(403)
+    expect((err as ApiError).code).toBe('CSRF_INVALID')
+    expect((err as ApiError).message).toBe('Your session security token expired. Sign in again.')
+  })
+
+  it('keeps a specific validation detail', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(problem(422, 'VALIDATION_ERROR', 'Invalid or reserved settings key'))
+    const err = (await api.getAdminSettings().catch((e: unknown) => e)) as ApiError
+    expect(err.message).toBe('Invalid or reserved settings key')
+  })
+
+  it('maps 423 to ACCOUNT_LOCKED with Retry-After seconds', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ title: 'Locked', status: 423 }), { status: 423, headers: { 'Retry-After': '600' } }),
+    )
+    const err = (await api.login({ role: 'Analyst', email: 'a@example.com', password: 'x' }).catch((e: unknown) => e)) as ApiError
+    expect(err.code).toBe('ACCOUNT_LOCKED')
+    expect(err.problem.retryAfterSeconds).toBe(600)
+  })
+
+  it('reports an unreachable service as status 0', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const err = (await api.listUsers().catch((e: unknown) => e)) as ApiError
+    expect(err.status).toBe(0)
+  })
+})
+
+describe('HttpApiClient — 401 handling', () => {
+  it('calls the unauthorized handler (→ login) on 401 from a protected route', async () => {
+    const onUnauthorized = vi.fn()
+    setUnauthorizedHandler(onUnauthorized)
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(problem(401, 'AUTH_REQUIRED', 'Authentication required'))
+    await expect(api.listUsers()).rejects.toBeInstanceOf(ApiError)
+    expect(onUnauthorized).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not redirect on a failed sign-in or an absent session', async () => {
+    const onUnauthorized = vi.fn()
+    setUnauthorizedHandler(onUnauthorized)
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(problem(401, 'INVALID_CREDENTIALS', 'invalid credentials'))
+    await expect(api.login({ role: 'Admin', email: 'a@example.com', password: 'x' })).rejects.toThrow(/Sign-in failed/)
+    fetchMock.mockResolvedValueOnce(problem(401, 'AUTH_REQUIRED', 'Authentication required'))
+    expect(await api.me()).toBeNull()
+    expect(onUnauthorized).not.toHaveBeenCalled()
+  })
+})
+
+describe('HttpApiClient — review fixes', () => {
+  it('posts one synonym row per variant', async () => {
+    const api = new HttpApiClient('/api/v1')
+    const row = (id: number, term: string) => json({ synonym_id: id, canonical: 'Java', term, relation: 'equivalent', status: 'approved', created_by: 1 })
+    fetchMock.mockResolvedValueOnce(row(1, 'J2EE')).mockResolvedValueOnce(row(2, 'JEE'))
+    const s = await api.createSynonym({ canonical: 'Java', variants: ['J2EE', 'JEE'], relation: 'Exact synonym' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(s.variants).toEqual(['J2EE', 'JEE'])
+  })
+
+  it('undoes saved variants when a later one fails', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock
+      .mockResolvedValueOnce(json({ synonym_id: 5, canonical: 'Java', term: 'J2EE', relation: 'equivalent', status: 'approved', created_by: 1 }))
+      .mockResolvedValueOnce(problem(409, 'CONFLICT', 'Synonym exists'))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    await expect(api.createSynonym({ canonical: 'Java', variants: ['J2EE', 'JEE'], relation: 'Exact synonym' })).rejects.toBeInstanceOf(ApiError)
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/v1/occ/synonyms/5')
+    expect((fetchMock.mock.calls[2][1] as RequestInit).method).toBe('DELETE')
+  })
+
+  it('keeps local-only settings per user and only after the server accepts the save', async () => {
+    localStorage.clear()
+    const api = new HttpApiClient('/api/v1')
+    const row = { resume_root_path: null, watch: { dl: { enabled: false, path: null, pattern: 'DL_*.xlsx' }, ct: { enabled: false, path: null, pattern: 'CT_*.xlsx' } }, active_model_id: null, density: 'comfortable' }
+    fetchMock.mockResolvedValueOnce(json(AUTH))
+    await api.login({ role: 'Admin', email: 'admin@example.com', password: 'x' })
+    fetchMock.mockResolvedValueOnce(json(row))
+    const s = await api.getMySettings()
+    fetchMock.mockResolvedValueOnce(problem(422, 'VALIDATION_ERROR', 'Invalid request'))
+    await expect(api.saveMySettings({ ...s, spoc1: 'Rejected SPOC' })).rejects.toBeInstanceOf(ApiError)
+    expect(localStorage.getItem('pfc.personal.local.1')).toBeNull()
+    fetchMock.mockResolvedValueOnce(json(row))
+    expect((await api.saveMySettings({ ...s, spoc1: 'SPOC A' })).spoc1).toBe('SPOC A')
+    fetchMock.mockResolvedValueOnce(json({ ...AUTH, user: { ...AUTH.user, user_id: 2 } })).mockResolvedValueOnce(json(row))
+    await api.login({ role: 'Analyst', email: 'b@example.com', password: 'x' })
+    expect((await api.getMySettings()).spoc1).toBe('')
+  })
+
+  it('sends the export passphrase and the pending-package source', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json({})).mockResolvedValueOnce(json([]))
+    await api.exportPackage('pass-1')
+    await api.importPackage({ pendingId: 'a'.repeat(64) })
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({ passphrase: 'pass-1' })
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)).toEqual({ pendingId: 'a'.repeat(64) })
+  })
+})
+
+describe('mappers', () => {
+  it('masks the draft recipient email', () => {
+    const d = toEmailDraft({ message_id: 1, demand_id: 1, resource_id: 1, result_id: 1, rank: 1, selected: true, to_address: 'jane.doe@example.com', cc: [], subject: 's', body_html: 'b', status: 'Draft', created_at: 'x', sent_at: null, last_error: null })
+    expect(d.toMasked).not.toContain('jane.doe')
+  })
+  it('maps requisition and match context from email drafts', () => {
+    const d = toEmailDraft({
+      message_id: 2,
+      demand_id: 3,
+      code_requisition: 'T10002',
+      account_name: 'Acme',
+      demand_request_name: 'Data Engineer',
+      resource_id: 4,
+      result_id: 5,
+      rank: 2,
+      candidate_name: 'Jane Doe',
+      score: 87.5,
+      band: 'Potential',
+      selected: true,
+      to_address: 'jane.doe@example.com',
+      cc: [],
+      subject: 's',
+      body_html: 'b',
+      status: 'Draft',
+      created_at: 'x',
+      sent_at: null,
+      last_error: null,
+    })
+    expect(d).toMatchObject({
+      codeRequisition: 'T10002',
+      accountName: 'Acme',
+      demandRequestName: 'Data Engineer',
+      candidateName: 'Jane Doe',
+      score: 87.5,
+      band: 'Potential',
+    })
+  })
+  it('flattens AuthView using the role chosen at login', () => {
+    expect(toCurrentUser({ ...AUTH, role_at_login: 'Analyst' }).role).toBe('Analyst')
+  })
+  it('round-trips grades (active ↔ retired, ordinal ↔ order)', () => {
+    const g = [toGrade({ code: 'B1', ordinal: 2, active: 0 }), toGrade({ code: 'A3', ordinal: 1, active: 1 })]
+    expect(fromGrades(g)).toEqual([
+      { code: 'A3', active: true },
+      { code: 'B1', active: false },
+    ])
+  })
+})
+
+describe('resolveApiMode', () => {
+  it('defaults to http, mock only by explicit flag', () => {
+    expect(resolveApiMode({ DEV: false }, '?mock=1')).toBe('http')
+    expect(resolveApiMode({ DEV: true }, '')).toBe('http')
+    expect(resolveApiMode({ DEV: true }, '?mock=1')).toBe('mock')
+    expect(resolveApiMode({ VITE_PFC_API: 'mock' }, '')).toBe('mock')
+    expect(resolveApiMode({ VITE_PFC_API: 'http', DEV: true }, '?mock=1')).toBe('http')
+  })
+})
+
+describe('HttpApiClient — OCC per-item CRUD', () => {
+  const calls = () => fetchMock.mock.calls.map(([u, i]) => `${(i as RequestInit).method ?? 'GET'} ${String(u)}`)
+
+  it('saves domains as delete plus add and reports the items that did not save', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock
+      .mockResolvedValueOnce(json([{ domain: 'old.example.com' }, { domain: 'keep.example.com' }]))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(problem(422, 'VALIDATION_ERROR', 'Invalid domain'))
+    const err = await api
+      .saveInternalDomains([{ domain: 'keep.example.com' }, { domain: 'bad' }, { domain: 'new.example.com' }])
+      .catch((e: unknown) => e)
+    expect(calls()).toEqual(['GET /api/v1/occ/internal-domains', 'DELETE /api/v1/occ/internal-domains/old.example.com', 'POST /api/v1/occ/internal-domains'])
+    expect((err as Error).message).toContain('Not saved: bad, new.example.com.')
+  })
+
+  it('upserts status-map entries by encoded source with the target status priority', async () => {
+    const api = new HttpApiClient('/api/v1')
+    const bench = [{ code: 'AVAILABLE', label: 'Available', is_excluded: 0, priority: 1, flag_in_gaps: 0, available_from_bench_start: 0 }]
+    fetchMock.mockResolvedValueOnce(json(bench)).mockResolvedValueOnce(json([])).mockResolvedValueOnce(json({})).mockResolvedValueOnce(json([]))
+    await api.saveStatusMap([{ sourceText: 'On bench / free', canonicalCode: 'AVAILABLE' }])
+    expect(calls()[2]).toBe('PUT /api/v1/occ/status-map/On%20bench%20%2F%20free')
+    expect(JSON.parse((fetchMock.mock.calls[2][1] as RequestInit).body as string)).toEqual({ canonical_code: 'AVAILABLE', priority: 1, is_excluded: false })
+  })
+
+  it('re-syncs stale status-map priorities after a bench status reorder', async () => {
+    const api = new HttpApiClient('/api/v1')
+    const row = { code: 'AVAILABLE', label: 'Available', is_excluded: 0, priority: 1, flag_in_gaps: 0, available_from_bench_start: 0 }
+    fetchMock
+      .mockResolvedValueOnce(json([row]))
+      .mockResolvedValueOnce(json({}))
+      .mockResolvedValueOnce(json([{ ...row, priority: 2 }]))
+      .mockResolvedValueOnce(
+        json([
+          { source_value: 'Free now', canonical_code: 'AVAILABLE', priority: 1, is_excluded: 0 },
+          { source_value: 'Ok', canonical_code: 'AVAILABLE', priority: 2, is_excluded: 0 },
+        ]),
+      )
+      .mockResolvedValueOnce(json({}))
+    await api.saveBenchStatuses([
+      { code: 'AVAILABLE', label: 'Available', eligibility: 'Eligible', priority: 2, tieredPoints: 4, caveat: '', availableFromBenchStart: false },
+    ])
+    expect(calls()).toEqual([
+      'GET /api/v1/occ/bench-statuses',
+      'PUT /api/v1/occ/bench-statuses/AVAILABLE',
+      'GET /api/v1/occ/bench-statuses',
+      'GET /api/v1/occ/status-map',
+      'PUT /api/v1/occ/status-map/Free%20now',
+    ])
+    expect(JSON.parse((fetchMock.mock.calls[4][1] as RequestInit).body as string)).toEqual({ canonical_code: 'AVAILABLE', priority: 2, is_excluded: false })
+  })
+
+  it('updates resource-team members by recipient id', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock
+      .mockResolvedValueOnce(json([{ recipient_id: 7, email: 'team@example.com', display_name: 'Team', is_active: 1 }]))
+      .mockResolvedValueOnce(json({}))
+      .mockResolvedValueOnce(json([]))
+    await api.saveResourceTeam([{ email: 'team@example.com', displayName: 'Team', active: false, notes: '' }])
+    expect(calls()[1]).toBe('PUT /api/v1/occ/resource-team/7')
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)).toEqual({ display_name: 'Team', is_active: false })
+  })
+})
+
+describe('HttpApiClient — resources and match runs (ingestion #12, matching #10)', () => {
+  const item = (id: number, eligibility: string) => ({
+    resource_id: id, short_name: `R${id}`, email_address: 'jane.doe@example.com', grade: 'C1', location: 'Pune',
+    bench_status: 'Available', bench_status_code: 'AVAILABLE', skills_raw: 'Java, Spring; SQL', unrecognised_skills: ['Spring'], available_capacity: 'Y',
+    bench_start_date: '2026-10-01', bench_end_date: null, group_name: 'G1', lifecycle: 'active', eligibility,
+    exclusion_reasons: eligibility === 'excluded' ? ['Status excluded'] : [], pending_review: false, unmapped_status: false, occ_pending_review: false,
+  })
+
+  it('unwraps and pages through ResourcePage for excluded resources', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock
+      .mockResolvedValueOnce(json({ items: [item(1, 'excluded'), item(2, 'excluded')], page: 1, page_size: 2, total: 3 }))
+      .mockResolvedValueOnce(json({ items: [item(3, 'excluded')], page: 2, page_size: 2, total: 3 }))
+    const rows = await api.listExcludedResources()
+    expect(fetchMock.mock.calls.map(([u]) => String(u))).toEqual([
+      '/api/v1/resources/excluded?page=1&page_size=200',
+      '/api/v1/resources/excluded?page=2&page_size=200',
+    ])
+    expect(rows.map((r) => r.resourceId)).toEqual([1, 2, 3])
+    expect(rows[0]).toMatchObject({ eligibility: 'excluded', skills: ['Java', 'Spring', 'SQL'], availableCapacity: 'Y', exclusionReasons: ['Status excluded'] })
+    expect(rows[0]?.emailAddressMasked).not.toContain('jane.doe')
+  })
+
+  it('stops paging on an empty page and fetches a single run by id', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json({ items: [], page: 1, page_size: 200, total: 5 })).mockResolvedValueOnce(json({ runId: 9, status: 'running' }))
+    expect(await api.listResources()).toEqual([])
+    expect((await api.getMatchRun(9)).status).toBe('running')
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe('/api/v1/match-runs/9')
+  })
+
+  it('marks identity from the email, not the bench-date pending_review flag', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(
+      json({ items: [{ ...item(1, 'eligible'), pending_review: true }, { ...item(2, 'eligible'), email_address: null }], page: 1, page_size: 200, total: 2 }),
+    )
+    expect((await api.listResources()).map((r) => r.identityStatus)).toEqual(['complete', 'incomplete'])
+  })
+
+  it('drafts emails from result IDs alone or an explicitly given run', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock
+      .mockResolvedValueOnce(json({ drafts: [], issues: [] }))
+      .mockResolvedValueOnce(json({ drafts: [], issues: [] }))
+    await api.createDrafts([7])
+    await api.createDrafts([8], 1)
+    const bodies = fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST').map(([, init]) => JSON.parse(String(init?.body)))
+    expect(bodies).toEqual([{ result_ids: [7] }, { run_id: 1, result_ids: [8] }])
+  })
+})
+
+describe('HttpApiClient — ingestion wiring', () => {
+  it('maps the IngestionRun upload reply to the preview', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(
+      json({
+        ingestion_run_id: 7,
+        kind: 'CT',
+        status: 'previewed',
+        file_name: 'ct.xlsx',
+        sheet_name: 'Sheet',
+        no_op: false,
+        counts: { rows_read: 3, rows_new: 2, rows_updated: 0, rows_unchanged: 0, rows_rejected: 1, rows_incomplete: 0 },
+        issues: [{ row_number: 4, column: 'Email Address', message: 'Invalid email', severity: 'error' }, { row_number: null, column: null, message: 'No Group column', severity: 'warning' }],
+      }),
+    )
+    const p = await api.uploadWorkbook('ct', new File(['x'], 'ct.xlsx'))
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/v1/uploads/ct')
+    expect(p).toEqual({
+      ingestionRunId: 7,
+      kind: 'ct',
+      fileName: 'ct.xlsx',
+      sheet: 'Sheet',
+      rowsRead: 3,
+      new: 2,
+      updated: 0,
+      unchanged: 0,
+      rejected: 1,
+      warnings: ['Row 4 (Email Address): Invalid email', 'No Group column'],
+      alreadyImported: false,
+    })
+  })
+
+  it('pages the demand list and maps rows, including the backend JD status', async () => {
+    const api = new HttpApiClient('/api/v1')
+    const row = (id: number) => ({ demand_id: id, code_requisition: `T1000${id}`, id_format_ok: true, position_start_date: null, account_name: 'Acme', code_local_grade: 'B1', demand_request_name: null, region: null, bu: null, owner: null, lifecycle: 'active', occ_pending_review: false, jd_status: 'JD changed' })
+    fetchMock.mockResolvedValueOnce(json({ items: [row(1)], page: 1, page_size: 200, total: 2 })).mockResolvedValueOnce(json({ items: [row(2)], page: 2, page_size: 200, total: 2 }))
+    const d = await api.listDemands()
+    expect(fetchMock.mock.calls.map(([u]) => String(u))).toEqual(['/api/v1/demands?page=1&page_size=200', '/api/v1/demands?page=2&page_size=200'])
+    expect(d.map((x) => x.codeRequisition)).toEqual(['T10001', 'T10002'])
+    expect(d[0]).toMatchObject({ demandId: 1, accountName: 'Acme', jdStatus: 'JD changed', matches: 0, bestBand: null })
+  })
+})
+
+describe('HttpApiClient — health (REQ-AUTH-06)', () => {
+  it('reads the data volume encryption status and defaults to Unknown', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json({ status: 'ok', details: { dataVolumeEncryption: 'Encrypted' } })).mockResolvedValueOnce(json({ status: 'ok' }))
+    expect(await api.getHealth()).toEqual({ status: 'ok', dataVolumeEncryption: 'Encrypted' })
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/v1/health')
+    expect(await api.getHealth()).toEqual({ status: 'ok', dataVolumeEncryption: 'Unknown' })
+  })
+})
+
+describe('HttpApiClient — current results', () => {
+  it('loads all current rows, summary and exclusions without a limit', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json([])).mockResolvedValueOnce(json({ demands: [], runs: [], staleDemandIds: [] })).mockResolvedValueOnce(json([]))
+    expect(await api.getCurrentResults()).toEqual([])
+    expect((await api.getCurrentResultsSummary()).demands).toEqual([])
+    expect(await api.getCurrentExcluded()).toEqual([])
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/v1/match-results/current', '/api/v1/match-results/current/summary', '/api/v1/match-results/current/excluded',
+    ])
+  })
+
+  it('maps effective exclusion state on current result rows', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json([{ effectiveExcluded: true }]))
+    expect((await api.getCurrentResults())[0]?.effectiveExcluded).toBe(true)
+  })
+
+  it('exports repeated result filter values and uses the current filename', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(new Response('csv', { headers: { 'Content-Type': 'text/csv' } }))
+    const file = await api.exportCurrentResults({ codeRequisition: ['A', 'B'], band: ['Strong', 'Potential'] }, 'csv', false)
+    const params = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost').searchParams
+    expect(params.getAll('requisition')).toEqual(['A', 'B'])
+    expect(params.getAll('band')).toEqual(['Strong', 'Potential'])
+    expect(file.fileName).toBe('PFC-results-current.csv')
+    expect(await file.blob.text()).toBe('csv')
+  })
+
+  it('propagates current endpoint errors', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(problem(403, 'FORBIDDEN', 'Not allowed'))
+    await expect(api.getCurrentResults()).rejects.toMatchObject({ status: 403, code: 'FORBIDDEN' })
+  })
+})
+
+describe('HttpApiClient — analytics and export wiring (REQ-OUT-04..09)', () => {
+  it('serialises analytics arrays as repeated keys and skips empty lists', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json({}))
+    await api.analyticsSummary({ codeRequisition: ['T1', 'T2'], band: ['Strong', 'Avg'], bu: [] })
+    const url = new URL(String(fetchMock.mock.calls[0]?.[0]), 'http://localhost')
+    expect(url.searchParams.getAll('codeRequisition')).toEqual(['T1', 'T2'])
+    expect(url.searchParams.getAll('band')).toEqual(['Strong', 'Avg'])
+    expect(url.searchParams.has('bu')).toBe(false)
+  })
+  it('sends only backend DashboardFilters keys, with the demand grade as grade', () => {
+    expect(
+      toDashboardQuery({ codeRequisition: ['T1'], demandGrade: ['B1'], personGrade: ['C1'], bu: [], scoreMin: 50 }),
+    ).toEqual({ codeRequisition: ['T1'], grade: ['B1'], scoreMin: 50 })
+  })
+
+  it('maps result filters onto the export query and leaves emails masked by default', () => {
+    const q = new URLSearchParams(
+      toExportQuery(
+        { codeRequisition: [' T1 '], accountName: ['Acme'], location: ['Pune'], band: ['Strong'], bu: ['X'], region: [], candidateType: ['Internal'], incompleteIdentity: ['no'], mandatorySkills: ['gap'], scoreMax: 90 },
+        'xlsx',
+        false,
+      ),
+    )
+    expect(Object.fromEntries(q)).toEqual({
+      format: 'xlsx',
+      requisition: 'T1',
+      account: 'Acme',
+      personLocation: 'Pune',
+      band: 'Strong',
+      scoreMax: '90',
+      bu: 'X',
+      candidateType: 'Internal',
+      incompleteIdentity: 'no',
+      mandatorySkills: 'gap',
+    })
+    expect(new URLSearchParams(toExportQuery({}, 'csv', true)).get('includeEmails')).toBe('true')
+  })
+
+  it('downloads the export with the server file name', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(
+      new Response('a,b\n', { headers: { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="PFC-results-run3.csv"' } }),
+    )
+    const f = await api.exportResults(3, { accountName: ['Acme'] }, 'csv', false)
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/v1/match-runs/3/export?format=csv&account=Acme')
+    expect(f.fileName).toBe('PFC-results-run3.csv')
+    expect(await f.blob.text()).toBe('a,b\n')
+  })
+
+  it('surfaces UNMASK_DISABLED when full emails are refused', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(problem(403, 'UNMASK_DISABLED', 'Unmasking is disabled for Analysts'))
+    const err = await api.exportResults(3, {}, 'csv', true).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).code).toBe('UNMASK_DISABLED')
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('includeEmails=true')
+  })
+
+  it('normalises analytics replies', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock
+      .mockResolvedValueOnce(json({ coveragePct: 50, bandDistribution: [{ label: 'Strong', count: 1 }], emailStatusCounts: [], validation: [{ id: 'v1', label: 'Check', passed: true }] }))
+      .mockResolvedValueOnce(
+        json({
+          run: null,
+          requisitionsAssessed: 0,
+          openRequisitions: 2,
+          roleToPersonCombinations: 0,
+          rolesWithNoSuitableCandidate: 0,
+          weakOnlyRequisitions: 0,
+          dataQualityIssues: { total: 1, dl: 1, ct: 0 },
+          eligibleBench: 1,
+          excludedBench: 1,
+          matchCoveragePct: 0,
+          emailsWithin24hPct: 0,
+        }),
+      )
+    const m = await api.analyticsMatch({ bu: ['X'] })
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/v1/analytics/match?bu=X')
+    expect(m.validation[0]).toEqual({ id: 'v1', label: 'Check', passed: true, detail: '' })
+    const s = await api.analyticsSummary({})
+    expect(s).toMatchObject({ run: null, openRequisitions: 2, dataQualityIssues: { total: 1, dl: 1, ct: 0 } })
+  })
+})
+
+describe('toResource — candidate link and CV status (REQ-IN-22)', () => {
+  const item: ResourceItem = {
+    resource_id: 5, candidate_id: 9, cv_versions_count: 2, short_name: 'Alex', email_address: 'alex@example.com', grade: 'B2', location: 'Pune',
+    bench_status: 'Bench', bench_status_code: 'BENCH', skills_raw: 'Java, SQL', unrecognised_skills: ['Java'], available_capacity: 'Y', bench_start_date: null, bench_end_date: null,
+    group_name: null, lifecycle: 'active', eligibility: 'eligible', exclusion_reasons: [], pending_review: false, unmapped_status: false, occ_pending_review: false,
+  }
+  it('maps candidate_id and cv_versions_count', () => {
+    expect(toResource(item)).toMatchObject({ candidateId: 9, cvCount: 2, cvStatus: 'Synced', unrecognisedSkills: ['Java'] })
+  })
+  it('leaves unlinked rows at candidateId 0 and Not synced', () => {
+    expect(toResource({ ...item, candidate_id: null, cv_versions_count: 0 })).toMatchObject({ candidateId: 0, cvCount: 0, cvStatus: 'Not synced' })
+  })
+})
+
+describe('HttpApiClient — CV sync (REQ-IN-21)', () => {
+  it('sends the selected ids as resource_ids', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json({ job_id: 3 }, 202))
+    await api.syncCvs([4, 5])
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/resources/cv-sync')
+    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({ resource_ids: [4, 5] })
+  })
+})
+
+describe('HttpApiClient — OCC email templates (REQ-EML-03)', () => {
+  const row = { email_template_id: 7, name: 'candidate', version: 2, subject: 'Opportunity {role}', body_html: '<p>{candidate_name}</p>', is_default: 1, created_by: 1, created_at: '2026-11-06T09:00:00Z' }
+
+  it('lists latest or all versions and maps rows to camelCase', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json([row])).mockResolvedValueOnce(json([row]))
+    expect(await api.listEmailTemplates(false)).toEqual([
+      { emailTemplateId: 7, name: 'candidate', version: 2, subject: 'Opportunity {role}', bodyHtml: '<p>{candidate_name}</p>', isDefault: true, createdBy: 1, createdAt: '2026-11-06T09:00:00Z' },
+    ])
+    await api.listEmailTemplates(true)
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual(['/api/v1/occ/email-templates', '/api/v1/occ/email-templates?all=true'])
+  })
+
+  it('creates a version with the snake_case body and sets the default by id', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(json(AUTH)).mockResolvedValueOnce(json(row, 201)).mockResolvedValueOnce(json(row)).mockResolvedValueOnce(json(row))
+    await api.login({ role: 'Admin', email: 'admin@example.com', password: 'x' })
+    await api.createEmailTemplate({ name: ' candidate ', subject: 'Opportunity {role}', bodyHtml: '<p>{candidate_name}</p>' })
+    expect(fetchMock.mock.calls[1][0]).toBe('/api/v1/occ/email-templates')
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)).toEqual({ name: 'candidate', subject: 'Opportunity {role}', body_html: '<p>{candidate_name}</p>' })
+    expect(headersOf(1)['X-CSRF-Token']).toBe('tok-1')
+    expect((await api.setDefaultEmailTemplate(7)).isDefault).toBe(true)
+    expect(fetchMock.mock.calls[2]).toMatchObject(['/api/v1/occ/email-templates/7/set-default', { method: 'POST' }])
+    expect((await api.getEmailTemplate(7)).bodyHtml).toBe('<p>{candidate_name}</p>')
+    expect(fetchMock.mock.calls[3][0]).toBe('/api/v1/occ/email-templates/7')
+  })
+
+  it('surfaces UNKNOWN_PLACEHOLDER', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockResolvedValueOnce(problem(422, 'UNKNOWN_PLACEHOLDER', 'Unknown email placeholder'))
+    await expect(api.createEmailTemplate({ name: 'x', subject: '{nope}', bodyHtml: '' })).rejects.toMatchObject({ code: 'UNKNOWN_PLACEHOLDER' })
+  })
+})
+
+describe('HttpApiClient — run excluded list (REQ-ELIG-08)', () => {
+  it('reads GET /match-runs/{id}/excluded', async () => {
+    const api = new HttpApiClient('/api/v1')
+    const row = { runId: 4, resourceId: 1, shortName: 'Alex', demandId: null, codeRequisition: null, reasonCode: 'NO_GRADE', detail: 'Person grade not recorded or unknown', scope: 'global' }
+    fetchMock.mockResolvedValueOnce(json([row]))
+    expect(await api.getRunExcluded(4)).toEqual([row])
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/v1/match-runs/4/excluded')
+  })
+})
+
+describe('HttpApiClient — resources across lifecycles', () => {
+  it('reads every lifecycle so off-bench people in an older run still resolve', async () => {
+    const api = new HttpApiClient('/api/v1')
+    fetchMock.mockImplementation(async () => json({ items: [], page: 1, page_size: 200, total: 0 }))
+    await api.listAllResources()
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([
+      '/api/v1/resources?lifecycle=active&page=1&page_size=200',
+      '/api/v1/resources?lifecycle=off_bench&page=1&page_size=200',
+      '/api/v1/resources?lifecycle=archived&page=1&page_size=200',
+    ])
+  })
+})
